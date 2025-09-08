@@ -1,0 +1,114 @@
+# FreeType WASM CMake Configuration
+# Priority 1: Foundation - Basic build, core fonts, memory management
+cmake_minimum_required(VERSION 3.12)
+project(FreeType2-WASM)
+
+# WASM-specific configuration
+set(CMAKE_SYSTEM_NAME Emscripten)
+set(CMAKE_SYSTEM_PROCESSOR wasm32)
+set(CMAKE_CROSSCOMPILING TRUE)
+set(CMAKE_SIZEOF_VOID_P 4)
+
+# Build configuration
+set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
+set(BUILD_SHARED_LIBS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
+
+# FreeType WASM configuration - Priority 1 (Foundation)
+set(FT_DISABLE_ZLIB OFF)        # Keep zlib support (internal)
+set(FT_DISABLE_BZIP2 ON)        # Disable bzip2 initially  
+set(FT_DISABLE_PNG ON)          # Disable PNG initially
+set(FT_DISABLE_HARFBUZZ ON)     # Disable HarfBuzz initially
+set(FT_DISABLE_BROTLI ON)       # Disable Brotli initially
+set(FT_ENABLE_ERROR_STRINGS OFF)# Reduce code size
+
+# Core Emscripten flags for FreeType
+set(WASM_CORE_FLAGS
+    -s WASM=1
+    -s MODULARIZE=1
+    -s EXPORT_ES6=1
+    -s EXPORT_NAME='FreeTypeModule'
+    -O3
+    -flto
+    --closure=1
+)
+
+# Memory configuration for font processing (64MB initial, 128MB max)
+set(WASM_MEMORY_FLAGS
+    -s ALLOW_MEMORY_GROWTH=1
+    -s INITIAL_MEMORY=67108864    # 64MB initial heap
+    -s MAXIMUM_MEMORY=134217728   # 128MB maximum heap  
+    -s TOTAL_STACK=5242880        # 5MB stack
+)
+
+# WASM-Native Runtime and API configuration
+set(WASM_RUNTIME_FLAGS
+    -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','setValue','getValue','FS','HEAPU8','HEAP32','writeFile','readFile','mkdir','mount','syncfs','createPreloadedFile','createLazyFile']
+    -s EXPORTED_FUNCTIONS=['_malloc','_free']
+    -s FORCE_FILESYSTEM=1         # Enable FS for font files
+    -s ASSERTIONS=0              # Disable assertions for performance
+    -s DISABLE_EXCEPTION_CATCHING=1  # FreeType uses return codes, not exceptions
+    -s ASYNCIFY=1                # Enable async operations for font loading
+    -s ENVIRONMENT=web,worker,node  # Support web, web worker, and node environments
+)
+
+# Combine all WASM flags
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${WASM_CORE_FLAGS} ${WASM_MEMORY_FLAGS} ${WASM_RUNTIME_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${WASM_CORE_FLAGS} ${WASM_MEMORY_FLAGS} ${WASM_RUNTIME_FLAGS}")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${WASM_CORE_FLAGS} ${WASM_MEMORY_FLAGS} ${WASM_RUNTIME_FLAGS}")
+
+# FreeType-specific optimizations for WASM
+add_definitions(
+    -DFT_CONFIG_OPTION_USE_LZW          # Enable LZW decompression
+    -DFT_CONFIG_OPTION_USE_ZLIB         # Enable zlib decompression
+    -DFT_CONFIG_MODULES_H=<ftmodule.h>  # Use standard module configuration
+)
+
+# WASM-specific compiler optimizations
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_definitions(-DNDEBUG)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffast-math -fomit-frame-pointer")
+endif()
+
+# Include original FreeType CMakeLists.txt
+include(${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt)
+
+# WASM-specific post-build steps
+if(TARGET freetype)
+    # Set custom properties for WASM build
+    set_target_properties(freetype PROPERTIES
+        SUFFIX ".js"
+        OUTPUT_NAME "freetype"
+    )
+    
+    # Additional linker flags for the final WASM module with WASM-native features
+    target_link_options(freetype PRIVATE 
+        "SHELL:-s EXPORTED_FUNCTIONS=['_FT_Init_FreeType','_FT_Done_FreeType','_FT_New_Face','_FT_New_Memory_Face','_FT_Done_Face','_FT_Set_Pixel_Sizes','_FT_Load_Glyph','_FT_Render_Glyph','_FT_Get_Char_Index','_FT_Load_Char','_malloc','_free','_emscripten_async_wget','_emscripten_wget_data']"
+        "SHELL:--pre-js ${CMAKE_CURRENT_SOURCE_DIR}/wasm/freetype-pre.js"
+        "SHELL:--preload-file ${CMAKE_CURRENT_SOURCE_DIR}/fonts@/fonts"
+        "SHELL:-lidbfs.js"  # Include IDBFS for persistent storage
+    )
+endif()
+
+# Installation configuration
+install(TARGETS freetype
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
+# Install headers
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+    DESTINATION include
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# Status output
+message(STATUS "FreeType WASM Configuration:")
+message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "  zlib Support: ${FT_DISABLE_ZLIB}")
+message(STATUS "  PNG Support: ${FT_DISABLE_PNG}")
+message(STATUS "  HarfBuzz Support: ${FT_DISABLE_HARFBUZZ}")
+message(STATUS "  Memory: 64MB initial, 128MB maximum")
+message(STATUS "  Stack: 5MB")
+message(STATUS "  Optimization: -O3 with LTO and Closure")

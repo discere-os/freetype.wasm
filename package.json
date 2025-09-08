@@ -1,0 +1,30 @@
+{
+  "name": "freetype-wasm",
+  "version": "2.13.3-wasm.1", 
+  "description": "High-performance FreeType font engine compiled to WebAssembly with comprehensive format support",
+  "main": "dist/node/freetype.js",
+  "module": "dist/browser-es6/freetype.js", 
+  "types": "dist/freetype.d.ts",
+  "scripts": {
+    "build": "./build-wasm.sh",
+    "test": "node performance_test.js",
+    "clean": "rm -rf build-wasm install dist"
+  },
+  "keywords": ["freetype", "fonts", "wasm", "webassembly", "typography", "ttf", "otf", "performance"],
+  "author": "Superstruct Ltd, New Zealand",
+  "license": "FTL",
+  "repository": {
+    "type": "git", 
+    "url": "https://github.com/superstruct/freetype.wasm"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "files": [
+    "dist/",
+    "build-wasm/",
+    "install/",
+    "wasm/",
+    "README.md",
+    "LICENSE.TXT"
+  ]
+}
