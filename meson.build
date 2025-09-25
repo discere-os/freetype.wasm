@@ -499,6 +499,8 @@ if get_option('tests').enabled()
   subdir('tests')
 endif
 
+subdir('wasm')
+
 
 # NOTE: Unlike the old `make refdoc` command, this generates the
 # documentation under `$BUILD/docs/` since Meson doesn't support modifying
