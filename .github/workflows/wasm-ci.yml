@@ -259,47 +259,195 @@ jobs:
           path: performance-results.txt
           retention-days: 90
 
-  release:
-    name: Create Release Assets
-    if: github.event_name == 'release'
-    needs: [build, performance]
+  deploy-cloudflare-release:
+    name: Deploy Release to Cloudflare R2
     runs-on: ubuntu-latest
-    
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: freetype-wasm-build
-          
+          path: ./
+
+      - name: Set release version
+        id: release-version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Calculate SHA-256
+        id: sha
+        run: |
+          WASM_FILE="install/lib/libfreetype.a"
+          SHA=$(sha256sum "$WASM_FILE" | awk '{print $1}')
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "${SHA}" > "${WASM_FILE}.sha256"
+          echo "🔒 SHA-256: ${SHA}"
+
+      - name: Deploy versioned WASM to Cloudflare R2
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            VERSION="${{ steps.release-version.outputs.VERSION }}"
+
+            # Deploy to @version path (immutable)
+            r2 object put discere-os-wasm-production/freetype/@${VERSION}/libfreetype.a \
+              --file=install/lib/libfreetype.a \
+              --content-type=application/octet-stream \
+              --cache-control="public, max-age=31536000, immutable"
+
+            r2 object put discere-os-wasm-production/freetype/@${VERSION}/libfreetype.a.sha256 \
+              --file=install/lib/libfreetype.a.sha256 \
+              --content-type=text/plain \
+              --cache-control="public, max-age=31536000, immutable"
+
+            # Deploy JavaScript wrapper if exists
+            if [ -f "wasm/freetype-wasm.js" ]; then
+              r2 object put discere-os-wasm-production/freetype/@${VERSION}/freetype-wasm.js \
+                --file=wasm/freetype-wasm.js \
+                --content-type=application/javascript \
+                --cache-control="public, max-age=31536000, immutable"
+            fi
+
+      - name: Deploy SHA path to Cloudflare R2
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            SHA="${{ steps.sha.outputs.sha }}"
+            SHA_SHORT="${SHA:0:7}"
+
+            # Deploy to @sha-xxx path (content-addressable, immutable)
+            r2 object put discere-os-wasm-production/freetype/@sha-${SHA_SHORT}/libfreetype.a \
+              --file=install/lib/libfreetype.a \
+              --content-type=application/octet-stream \
+              --cache-control="public, max-age=31536000, immutable"
+
+            r2 object put discere-os-wasm-production/freetype/@sha-${SHA_SHORT}/libfreetype.a.sha256 \
+              --file=install/lib/libfreetype.a.sha256 \
+              --content-type=text/plain \
+              --cache-control="public, max-age=31536000, immutable"
+
+      - name: Update latest pointer
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            VERSION="${{ steps.release-version.outputs.VERSION }}"
+            echo "${VERSION}" > latest.txt
+
+            # Update @latest.txt pointer (short cache)
+            r2 object put discere-os-wasm-production/freetype/@latest.txt \
+              --file=latest.txt \
+              --content-type=text/plain \
+              --cache-control="public, max-age=300"
+
+      - name: Verify Cloudflare deployment
+        run: |
+          sleep 15  # Wait for R2 propagation
+          curl -f "https://wasm.discere.cloud/freetype@${{ steps.release-version.outputs.VERSION }}/libfreetype.a" || exit 1
+          echo "✅ Cloudflare R2 deployment verified"
+
+  deploy-cloudflare-snapshot:
+    name: Deploy Snapshot to Cloudflare R2
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/wasm' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: freetype-wasm-build
+          path: ./
+
+      - name: Set snapshot version
+        id: version
+        run: echo "VERSION=sha-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Calculate SHA-256
+        id: sha
+        run: |
+          WASM_FILE="install/lib/libfreetype.a"
+          SHA=$(sha256sum "$WASM_FILE" | awk '{print $1}')
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "${SHA}" > "${WASM_FILE}.sha256"
+          echo "🔒 SHA-256: ${SHA}"
+
+      - name: Deploy snapshot WASM to Cloudflare R2
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            VERSION="${{ steps.version.outputs.VERSION }}"
+
+            # Deploy to @sha-xxx path (snapshot)
+            r2 object put discere-os-wasm-production/freetype/@${VERSION}/libfreetype.a \
+              --file=install/lib/libfreetype.a \
+              --content-type=application/octet-stream \
+              --cache-control="public, max-age=31536000, immutable"
+
+            r2 object put discere-os-wasm-production/freetype/@${VERSION}/libfreetype.a.sha256 \
+              --file=install/lib/libfreetype.a.sha256 \
+              --content-type=text/plain \
+              --cache-control="public, max-age=31536000, immutable"
+
+      - name: Log deployment success
+        run: echo "✅ Snapshot ${{ steps.version.outputs.VERSION }} deployed to Cloudflare R2"
+
+  release:
+    name: Create Release Assets
+    if: github.event_name == 'release'
+    needs: [build, performance, deploy-cloudflare-release]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: freetype-wasm-build
+
       - name: Download performance results
         uses: actions/download-artifact@v4
         with:
           name: performance-results
-          
+
       - name: Create release bundle
         run: |
           mkdir -p release/{build,dist,wasm}
           mkdir -p release/dist/{browser-es6,node}
-          
+
           # Core build files
           cp -r install/* release/build/
           cp -r wasm/* release/wasm/
-          
+
           # Distribution files (prepare structure for Priority 2)
           cp wasm/freetype-wasm.js wasm/freetype-wasm.d.ts release/dist/node/
           cp wasm/freetype-wasm.js wasm/freetype-wasm.d.ts release/dist/browser-es6/
-          
+
           # Documentation
           cp README LICENSE.TXT release/ || echo "Some files missing, continuing"
           cp performance-results.txt release/
-          
+
           # Create archives
           tar -czf freetype.wasm-${GITHUB_REF#refs/tags/}.tar.gz -C release .
           zip -r freetype.wasm-${GITHUB_REF#refs/tags/}.zip release/
-          
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v1
         with:
@@ -309,9 +457,9 @@ jobs:
             performance-results.txt
           body: |
             ## freetype.wasm System Tier 2 Foundation Release
-            
+
             Complete FreeType 2.13.3 font engine compiled to WebAssembly - the foundational typography library for the entire graphics ecosystem.
-            
+
             ### 🏗️ Foundational Library Impact
             FreeType.wasm serves as the cornerstone font engine for:
             - **gtk.wasm**: UI component text rendering
@@ -319,14 +467,14 @@ jobs:
             - **cairo.wasm**: Vector graphics with typography support
             - **librsvg.wasm**: SVG text elements and web fonts
             - **Qt.wasm**: Cross-platform application text rendering
-            
+
             ### ⚡ Performance Results
             - **Font Loading**: <20ms for 1MB font files (25% faster than target)
             - **Glyph Rendering**: <2ms per glyph with intelligent caching
             - **TrueType Interpreter**: 1500+ glyphs/second processing
             - **Memory Efficiency**: <50% heap utilization (45% average)
             - **Cache Hit Rate**: >95% for repeated glyph rendering
-            
+
             ### 🎯 System Tier 2 Features
             - ✅ **Core Font Formats**: TTF, OTF with full hinting support
             - ✅ **Zero Dependencies**: Self-contained font processing engine
@@ -334,32 +482,41 @@ jobs:
             - ✅ **JavaScript API**: High-level wrapper for web integration
             - ✅ **TrueType Interpreter**: Complete bytecode execution engine
             - ✅ **Cross-Platform**: Browser, Node.js, and Web Worker support
-            
+
+            ### 🌐 CDN Access
+            ```bash
+            # Latest version
+            https://wasm.discere.cloud/freetype@latest/libfreetype.a
+
+            # Specific version
+            https://wasm.discere.cloud/freetype@v2.13.3/libfreetype.a
+            ```
+
             ### 🚀 Quick Start
             ```javascript
             import FreeTypeEngine from './dist/node/freetype-wasm.js';
-            
+
             // Initialize FreeType
             const ft = new FreeTypeEngine(await FreeTypeModule());
             await ft.initialize();
-            
+
             // Load a font
             const fontBuffer = await fetch('font.ttf').then(r => r.arrayBuffer());
             await ft.loadFont(fontBuffer, 'myFont');
-            
+
             // Render glyphs
             const glyph = ft.renderGlyph('myFont', 65, 24); // 'A' at 24px
             ```
-            
+
             ### 📦 Package Contents
             - `build/`: Core static library and headers for C/C++ integration
             - `wasm/`: JavaScript API wrappers and TypeScript definitions
             - `dist/`: Distribution packages for Node.js and browser environments
             - Performance benchmarks and comprehensive documentation
-            
+
             ### 🔄 Roadmap
             - **Priority 2**: Web font support (WOFF, WOFF2), performance optimization
             - **Priority 3**: SIMD acceleration, WebGPU integration, advanced typography
-            
+
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

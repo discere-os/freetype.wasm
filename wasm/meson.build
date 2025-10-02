@@ -36,9 +36,17 @@ shared_module(
   files('freetype_wasm_side.c'),
   dependencies: [freetype_dep],
   name_prefix: '',
+  name_suffix: 'wasm',
   c_args: ft_wasm_cargs,
   link_args: ft_side_link_args,
   install: true,
   install_dir: get_option('libdir'),
+)
+
+# Create symbolic link for ft2build.h at top level for harfbuzz compatibility
+install_symlink(
+  'ft2build.h',
+  pointing_to: 'freetype2/ft2build.h',
+  install_dir: get_option('includedir'),
 )
 
