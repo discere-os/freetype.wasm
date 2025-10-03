@@ -28,6 +28,7 @@ ft_side_link_args = [
   '-fPIC',
   '-O3',
   '-flto',
+  '-sERROR_ON_UNDEFINED_SYMBOLS=0',  # Host provides dependencies
   '-sEXPORTED_FUNCTIONS=["_freetype_wasm_version"]',
 ]
 
