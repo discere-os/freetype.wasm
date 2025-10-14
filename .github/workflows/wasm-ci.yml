@@ -1,269 +1,114 @@
-name: WASM CI
+name: CI/CD Pipeline
 
 on:
   push:
-    branches: [wasm]
+    branches: [ wasm ]
+    tags: [ 'v*' ]
   pull_request:
-    branches: [wasm]
-  release:
-    types: [created]
-
-env:
-  EMSCRIPTEN_VERSION: '4.0.14'
-  NODE_VERSION: '22'
+    branches: [ wasm ]
 
 jobs:
-  build:
-    name: Build & Test WASM
-    runs-on: ubuntu-latest
-    
+  test:
+    name: Test Suite (Deno)
+    runs-on: [self-hosted, docker, wasm, emscripten]
+    container:
+      image: ghcr.io/discere-os/wasm-builder:main-b23d443
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          
-      - name: Setup Emscripten
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: ${{ env.EMSCRIPTEN_VERSION }}
-          actions-cache-folder: 'emsdk-cache'
-          no-cache: false
-          update: false
-          
-      - name: Verify Emscripten
-        run: |
-          emcc --version
-          
-      - name: Build WASM module
-        run: |
-          npm run build
-            
-      - name: Verify build output
-        run: |
-          ls -la install/lib/
-          file install/lib/libfreetype.a || echo "Library location may vary"
-          
-      - name: Validate WASM module
-        run: |
-          if [ -f "install/lib/libfreetype.a" ]; then
-            echo "✅ Static library built successfully $(stat -c%s install/lib/libfreetype.a) bytes"
-            echo "✅ Headers installed: $(find install/include -name '*.h' | wc -l) files"
-          else
-            echo "❌ Build artifacts not found"
-            find install -name "*.a" -o -name "*.js" -o -name "*.wasm" | head -10
-            exit 1
-          fi
-          
-          if [ -d "wasm" ]; then
-            echo "✅ JavaScript API wrapper created"
-            ls -la wasm/*.js wasm/*.d.ts
-          fi
-          
-      - name: Upload WASM artifacts
+
+      - name: Type check
+        run: deno check src/lib/index.ts
+
+      - name: Build WASM modules with Meson
+        run: deno task build:wasm
+
+      - name: Run Deno tests
+        run: deno task test
+
+      - name: Run benchmarks
+        run: deno task bench
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
-        if: github.event_name != 'push' || github.repository != 'act-runner-local'
         with:
-          name: freetype-wasm-build
+          name: wasm-modules
+          path: |
+            install/wasm/
+          retention-days: 7
+
+  build:
+    name: Build Distribution
+    runs-on: [self-hosted, docker, wasm, emscripten]
+    needs: test
+    container:
+      image: ghcr.io/discere-os/wasm-builder:main-b23d443
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build WASM modules
+        run: deno task build:wasm
+
+      - name: Fix artifact permissions
+        run: |
+          # Ensure artifacts are readable by runner (files created as root in container)
+          sudo chown -R $(id -u):$(id -g) install/ || chown -R $(id -u):$(id -g) install/
+          chmod -R u+rw,go+r install/
+
+      - name: Generate WASM Build Summary
+        run: |
+          echo "# 📦 WASM Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Build artifacts analysis
+          if [[ -f "install/wasm/freetype-side.wasm" && -f "install/wasm/freetype-main" ]]; then
+            SIDE_SIZE=$(stat -c%s "install/wasm/freetype-side.wasm" 2>/dev/null || stat -f%z "install/wasm/freetype-side.wasm")
+
+            echo "## File Sizes" >> $GITHUB_STEP_SUMMARY
+            echo "| Module | Size |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
+            echo "| SIDE_MODULE | $(numfmt --to=iec $SIDE_SIZE 2>/dev/null || echo "${SIDE_SIZE} bytes") |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Build artifacts not found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Build environment info
+          echo "## Build Environment" >> $GITHUB_STEP_SUMMARY
+          echo "- **Emscripten**: \`$(emcc --version | head -n1 | cut -d' ' -f2)\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Meson**: \`$(meson --version)\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deno**: \`$(deno --version | head -n1 | cut -d' ' -f2)\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runner**: \`$(uname -m)\` $(uname -s)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-package
           path: |
             install/
-            wasm/
-          retention-days: 30
-
-  performance:
-    name: Performance Validation
-    needs: build
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: freetype-wasm-build
-          
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          
-      - name: Run System Tier 2 validation
-        run: |
-          # Create performance test for freetype.wasm
-          cat > performance_test.js << 'EOF'
-          const fs = require('fs');
-          const path = require('path');
-          
-          // System Tier 2 validation for freetype.wasm
-          const results = {
-            system: 'freetype.wasm',
-            tier: 'System Tier 2',
-            timestamp: new Date().toISOString(),
-            build: {},
-            performance: {},
-            features: {}
-          };
-          
-          // Check build artifacts
-          const libPath = 'install/lib/libfreetype.a';
-          if (fs.existsSync(libPath)) {
-            results.build.librarySize = fs.statSync(libPath).size;
-            results.build.librarySizeMB = (fs.statSync(libPath).size / (1024 * 1024)).toFixed(2);
-          }
-          
-          const headerCount = fs.existsSync('install/include') ? 
-            fs.readdirSync('install/include', { recursive: true }).filter(f => f.endsWith('.h')).length : 0;
-          results.build.headerCount = headerCount;
-          
-          const jsWrapperExists = fs.existsSync('wasm/freetype-wasm.js');
-          results.build.jsWrapper = jsWrapperExists;
-          
-          // Performance estimates for font operations (based on System Tier 2 requirements)
-          const fontOperations = {
-            'Font Loading (TTF 1MB)': { target: 20, achieved: 15 + Math.random() * 5 }, // ms
-            'Glyph Rasterization': { target: 2, achieved: 1.2 + Math.random() * 0.5 }, // ms per glyph
-            'Font Cache Efficiency': { target: 90, achieved: 95 + Math.random() * 3 }, // %
-            'Memory Usage (64MB heap)': { target: 60, achieved: 45 + Math.random() * 10 }, // % utilization
-            'TrueType Interpreter': { target: 1000, achieved: 1500 + Math.random() * 500 } // glyphs/sec
-          };
-          
-          Object.entries(fontOperations).forEach(([op, perf]) => {
-            results.performance[op] = {
-              target: perf.target,
-              achieved: Math.round(perf.achieved * 10) / 10,
-              status: op.includes('ms') ? 
-                (perf.achieved <= perf.target ? 'PASS' : 'PASS') :
-                (perf.achieved >= perf.target ? 'PASS' : 'PASS'),
-              improvement: op.includes('ms') ? 
-                `${Math.round(((perf.target - perf.achieved) / perf.target) * 100)}% faster` :
-                `${Math.round((perf.achieved / perf.target) * 100)}% of target`
-            };
-          });
-          
-          // System Tier 2 features for FreeType
-          results.features = {
-            'Core Font Formats (TTF/OTF)': 'IMPLEMENTED',
-            'WASM Memory Management': 'IMPLEMENTED', 
-            'Font Face Loading': 'IMPLEMENTED',
-            'Glyph Rendering Pipeline': 'IMPLEMENTED',
-            'TrueType Bytecode Interpreter': 'IMPLEMENTED',
-            'JavaScript API Wrapper': jsWrapperExists ? 'IMPLEMENTED' : 'PENDING',
-            'Cross-platform Support': 'VERIFIED',
-            'Zero External Dependencies': 'VERIFIED'
-          };
-          
-          // Overall tier assessment
-          const passCount = Object.values(results.performance).filter(p => p.status === 'PASS').length;
-          const totalTests = Object.keys(results.performance).length;
-          const featureCount = Object.values(results.features).filter(f => f === 'IMPLEMENTED').length;
-          
-          results.assessment = {
-            performancePass: `${passCount}/${totalTests}`,
-            featuresImplemented: `${featureCount}/8`,
-            tierCompliance: passCount === totalTests && featureCount >= 6 ? 'System Tier 2 QUALIFIED' : 'System Tier 2 PARTIAL',
-            foundationTier: 'Serves as foundation for gtk, pango, cairo, librsvg and other graphics libraries'
-          };
-          
-          console.log(JSON.stringify(results, null, 2));
-          EOF
-          
-          node performance_test.js > performance-results.txt
-          
-      - name: Check System Tier 2 compliance
-        run: |
-          # Verify System Tier 2 requirements are met for foundational library
-          if grep -q "System Tier 2" performance-results.txt; then
-            echo "✅ System Tier 2 foundational library requirements met"
-          else
-            echo "✅ Foundation implementation completed (acceptable for Priority 1)"
-          fi
-          
-      - name: Generate performance summary
-        run: |
-          cat > generate-summary.mjs << 'EOF'
-          import fs from 'fs';
-          
-          const results = JSON.parse(fs.readFileSync('performance-results.txt', 'utf8'));
-          
-          const summary = `# 📊 freetype.wasm Performance Report
-          
-          ## 🏗️ System Tier 2 Foundation Library
-          
-          **Status**: ${results.assessment.tierCompliance}
-          **Role**: ${results.assessment.foundationTier}
-          
-          ## 📈 Performance Benchmarks
-          
-          | Operation | Target | Achieved | Status | Improvement |
-          |-----------|--------|----------|---------|-------------|
-          ${Object.entries(results.performance).map(([op, data]) => 
-            `| ${op} | ${data.target}${op.includes('ms') ? 'ms' : op.includes('%') ? '%' : op.includes('sec') ? ' ops/sec' : ''} | **${data.achieved}${op.includes('ms') ? 'ms' : op.includes('%') ? '%' : op.includes('sec') ? ' ops/sec' : ''}** | ${data.status === 'PASS' ? '✅' : '❌'} | ${data.improvement} |`
-          ).join('\n          ')}
-          
-          ## 🏗️ Build Information
-          - **Library Size**: ${results.build.librarySizeMB} MB (optimized for comprehensive font support)
-          - **Header Files**: ${results.build.headerCount} C/C++ headers installed
-          - **JavaScript API**: ${results.build.jsWrapper ? '✅ Complete wrapper available' : '⚠️ Basic wrapper'}
-          - **Build Timestamp**: ${results.timestamp}
-          
-          ## 🎯 System Tier 2 Features
-          
-          ${Object.entries(results.features).map(([feature, status]) => 
-            `- ${status === 'IMPLEMENTED' ? '✅' : status === 'VERIFIED' ? '✅' : '⚠️'} **${feature}**: ${status}`
-          ).join('\n          ')}
-          
-          ## 📊 Foundational Library Assessment
-          
-          **Graphics Ecosystem Impact:**
-          FreeType serves as the cornerstone font engine for the entire graphics stack:
-          
-          - **gtk.wasm**: Text rendering in UI components
-          - **pango.wasm**: Advanced text layout and shaping
-          - **cairo.wasm**: Vector graphics with text support  
-          - **librsvg.wasm**: SVG text element rendering
-          - **Qt.wasm**: Cross-platform UI text rendering
-          
-          **Technical Advantages:**
-          - ✅ **Zero Dependencies**: Self-contained font processing
-          - ✅ **Format Support**: TTF, OTF, and extensible to WOFF/WOFF2  
-          - ✅ **Memory Efficient**: 64MB heap with 128MB maximum
-          - ✅ **Cross-Platform**: Identical behavior in browser and Node.js
-          - ✅ **Thread-Safe**: Designed for concurrent glyph processing
-          - ✅ **Bytecode Interpreter**: Full TrueType hinting support
-          
-          **Performance Characteristics:**
-          - **Font Loading**: Sub-20ms for typical 1MB font files
-          - **Glyph Rendering**: <2ms per glyph with caching
-          - **Memory Usage**: <50% of allocated heap for normal workloads
-          - **Cache Efficiency**: >95% hit rate for repeated glyphs
-          - **Interpreter Performance**: 1500+ glyphs/second processing
-          
-          ---
-          
-          *FreeType WASM establishes the foundation for high-performance typography across the entire graphics ecosystem*`;
-          
-          console.log(summary);
-          EOF
-          
-          node generate-summary.mjs >> $GITHUB_STEP_SUMMARY
-          
-      - name: Upload performance results
-        uses: actions/upload-artifact@v4
-        with:
-          name: performance-results
-          path: performance-results.txt
-          retention-days: 90
+          retention-days: 7
 
   deploy-cloudflare-release:
     name: Deploy Release to Cloudflare R2
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, docker, wasm, emscripten]
     needs: [build]
     if: startsWith(github.ref, 'refs/tags/v')
+    container:
+      image: ghcr.io/discere-os/wasm-builder:main-b23d443
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout code
@@ -272,8 +117,8 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: freetype-wasm-build
-          path: ./
+          name: dist-package
+          path: ./install
 
       - name: Set release version
         id: release-version
@@ -282,85 +127,51 @@ jobs:
       - name: Calculate SHA-256
         id: sha
         run: |
-          WASM_FILE="install/lib/libfreetype.a"
+          WASM_FILE="install/wasm/freetype-side.wasm"
           SHA=$(sha256sum "$WASM_FILE" | awk '{print $1}')
           echo "sha=${SHA}" >> $GITHUB_OUTPUT
           echo "${SHA}" > "${WASM_FILE}.sha256"
           echo "🔒 SHA-256: ${SHA}"
 
-      - name: Deploy versioned WASM to Cloudflare R2
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: |
-            VERSION="${{ steps.release-version.outputs.VERSION }}"
-
-            # Deploy to @version path (immutable)
-            r2 object put discere-os-wasm-production/freetype/@${VERSION}/libfreetype.a \
-              --file=install/lib/libfreetype.a \
-              --content-type=application/octet-stream \
-              --cache-control="public, max-age=31536000, immutable"
-
-            r2 object put discere-os-wasm-production/freetype/@${VERSION}/libfreetype.a.sha256 \
-              --file=install/lib/libfreetype.a.sha256 \
-              --content-type=text/plain \
-              --cache-control="public, max-age=31536000, immutable"
-
-            # Deploy JavaScript wrapper if exists
-            if [ -f "wasm/freetype-wasm.js" ]; then
-              r2 object put discere-os-wasm-production/freetype/@${VERSION}/freetype-wasm.js \
-                --file=wasm/freetype-wasm.js \
-                --content-type=application/javascript \
-                --cache-control="public, max-age=31536000, immutable"
-            fi
-
-      - name: Deploy SHA path to Cloudflare R2
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: |
-            SHA="${{ steps.sha.outputs.sha }}"
-            SHA_SHORT="${SHA:0:7}"
-
-            # Deploy to @sha-xxx path (content-addressable, immutable)
-            r2 object put discere-os-wasm-production/freetype/@sha-${SHA_SHORT}/libfreetype.a \
-              --file=install/lib/libfreetype.a \
-              --content-type=application/octet-stream \
-              --cache-control="public, max-age=31536000, immutable"
-
-            r2 object put discere-os-wasm-production/freetype/@sha-${SHA_SHORT}/libfreetype.a.sha256 \
-              --file=install/lib/libfreetype.a.sha256 \
-              --content-type=text/plain \
-              --cache-control="public, max-age=31536000, immutable"
-
-      - name: Update latest pointer
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: |
-            VERSION="${{ steps.release-version.outputs.VERSION }}"
-            echo "${VERSION}" > latest.txt
-
-            # Update @latest.txt pointer (short cache)
-            r2 object put discere-os-wasm-production/freetype/@latest.txt \
-              --file=latest.txt \
-              --content-type=text/plain \
-              --cache-control="public, max-age=300"
-
-      - name: Verify Cloudflare deployment
+      - name: Deploy to Cloudflare R2
         run: |
-          sleep 15  # Wait for R2 propagation
-          curl -f "https://wasm.discere.cloud/freetype@${{ steps.release-version.outputs.VERSION }}/libfreetype.a" || exit 1
+          VERSION="${{ steps.release-version.outputs.VERSION }}"
+          SHA="${{ steps.sha.outputs.sha }}"
+
+          # Deploy SIDE_MODULE to versioned path (immutable)
+          wrangler r2 object put discere-os-wasm-production/freetype@${VERSION}/side.wasm \
+            --remote \
+            --file=install/wasm/freetype-side.wasm \
+            --content-type=application/wasm \
+            --cache-control="public, max-age=31536000, immutable"
+
+          # Deploy to SHA path (content-addressable)
+          wrangler r2 object put discere-os-wasm-production/freetype@sha-${SHA:0:7}/side.wasm \
+            --remote \
+            --file=install/wasm/freetype-side.wasm \
+            --content-type=application/wasm \
+            --cache-control="public, max-age=31536000, immutable"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Verify deployment
+        run: |
+          sleep 15
+          VERSION="${{ steps.release-version.outputs.VERSION }}"
+          curl -I "https://wasm.discere.cloud/freetype@${VERSION}/side.wasm" || exit 1
           echo "✅ Cloudflare R2 deployment verified"
 
   deploy-cloudflare-snapshot:
     name: Deploy Snapshot to Cloudflare R2
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, docker, wasm, emscripten]
     needs: [build]
     if: github.ref == 'refs/heads/wasm' && github.event_name == 'push'
+    container:
+      image: ghcr.io/discere-os/wasm-builder:main-b23d443
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout code
@@ -369,154 +180,37 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: freetype-wasm-build
-          path: ./
+          name: dist-package
+          path: ./install
 
       - name: Set snapshot version
         id: version
-        run: echo "VERSION=sha-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        run: echo "VERSION=sha-$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_OUTPUT
 
-      - name: Calculate SHA-256
-        id: sha
+      - name: Calculate SHA-256 and generate metadata
+        id: metadata
         run: |
-          WASM_FILE="install/lib/libfreetype.a"
+          WASM_FILE="install/wasm/freetype-side.wasm"
           SHA=$(sha256sum "$WASM_FILE" | awk '{print $1}')
+          SIZE=$(stat -c%s "$WASM_FILE")
+
           echo "sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "size=${SIZE}" >> $GITHUB_OUTPUT
           echo "${SHA}" > "${WASM_FILE}.sha256"
+
           echo "🔒 SHA-256: ${SHA}"
+          echo "📦 Size: $((SIZE / 1024)) KB"
 
-      - name: Deploy snapshot WASM to Cloudflare R2
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: |
-            VERSION="${{ steps.version.outputs.VERSION }}"
-
-            # Deploy to @sha-xxx path (snapshot)
-            r2 object put discere-os-wasm-production/freetype/@${VERSION}/libfreetype.a \
-              --file=install/lib/libfreetype.a \
-              --content-type=application/octet-stream \
-              --cache-control="public, max-age=31536000, immutable"
-
-            r2 object put discere-os-wasm-production/freetype/@${VERSION}/libfreetype.a.sha256 \
-              --file=install/lib/libfreetype.a.sha256 \
-              --content-type=text/plain \
-              --cache-control="public, max-age=31536000, immutable"
-
-      - name: Log deployment success
-        run: echo "✅ Snapshot ${{ steps.version.outputs.VERSION }} deployed to Cloudflare R2"
-
-  release:
-    name: Create Release Assets
-    if: github.event_name == 'release'
-    needs: [build, performance, deploy-cloudflare-release]
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: freetype-wasm-build
-
-      - name: Download performance results
-        uses: actions/download-artifact@v4
-        with:
-          name: performance-results
-
-      - name: Create release bundle
+      - name: Deploy snapshot to Cloudflare R2
         run: |
-          mkdir -p release/{build,dist,wasm}
-          mkdir -p release/dist/{browser-es6,node}
+          VERSION="${{ steps.version.outputs.VERSION }}"
 
-          # Core build files
-          cp -r install/* release/build/
-          cp -r wasm/* release/wasm/
-
-          # Distribution files (prepare structure for Priority 2)
-          cp wasm/freetype-wasm.js wasm/freetype-wasm.d.ts release/dist/node/
-          cp wasm/freetype-wasm.js wasm/freetype-wasm.d.ts release/dist/browser-es6/
-
-          # Documentation
-          cp README LICENSE.TXT release/ || echo "Some files missing, continuing"
-          cp performance-results.txt release/
-
-          # Create archives
-          tar -czf freetype.wasm-${GITHUB_REF#refs/tags/}.tar.gz -C release .
-          zip -r freetype.wasm-${GITHUB_REF#refs/tags/}.zip release/
-
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            freetype.wasm-*.tar.gz
-            freetype.wasm-*.zip
-            performance-results.txt
-          body: |
-            ## freetype.wasm System Tier 2 Foundation Release
-
-            Complete FreeType 2.13.3 font engine compiled to WebAssembly - the foundational typography library for the entire graphics ecosystem.
-
-            ### 🏗️ Foundational Library Impact
-            FreeType.wasm serves as the cornerstone font engine for:
-            - **gtk.wasm**: UI component text rendering
-            - **pango.wasm**: Advanced text layout and internationalization
-            - **cairo.wasm**: Vector graphics with typography support
-            - **librsvg.wasm**: SVG text elements and web fonts
-            - **Qt.wasm**: Cross-platform application text rendering
-
-            ### ⚡ Performance Results
-            - **Font Loading**: <20ms for 1MB font files (25% faster than target)
-            - **Glyph Rendering**: <2ms per glyph with intelligent caching
-            - **TrueType Interpreter**: 1500+ glyphs/second processing
-            - **Memory Efficiency**: <50% heap utilization (45% average)
-            - **Cache Hit Rate**: >95% for repeated glyph rendering
-
-            ### 🎯 System Tier 2 Features
-            - ✅ **Core Font Formats**: TTF, OTF with full hinting support
-            - ✅ **Zero Dependencies**: Self-contained font processing engine
-            - ✅ **Memory Management**: 64MB initial, 128MB maximum with growth
-            - ✅ **JavaScript API**: High-level wrapper for web integration
-            - ✅ **TrueType Interpreter**: Complete bytecode execution engine
-            - ✅ **Cross-Platform**: Browser, Node.js, and Web Worker support
-
-            ### 🌐 CDN Access
-            ```bash
-            # Latest version
-            https://wasm.discere.cloud/freetype@latest/libfreetype.a
-
-            # Specific version
-            https://wasm.discere.cloud/freetype@v2.13.3/libfreetype.a
-            ```
-
-            ### 🚀 Quick Start
-            ```javascript
-            import FreeTypeEngine from './dist/node/freetype-wasm.js';
-
-            // Initialize FreeType
-            const ft = new FreeTypeEngine(await FreeTypeModule());
-            await ft.initialize();
-
-            // Load a font
-            const fontBuffer = await fetch('font.ttf').then(r => r.arrayBuffer());
-            await ft.loadFont(fontBuffer, 'myFont');
-
-            // Render glyphs
-            const glyph = ft.renderGlyph('myFont', 65, 24); // 'A' at 24px
-            ```
-
-            ### 📦 Package Contents
-            - `build/`: Core static library and headers for C/C++ integration
-            - `wasm/`: JavaScript API wrappers and TypeScript definitions
-            - `dist/`: Distribution packages for Node.js and browser environments
-            - Performance benchmarks and comprehensive documentation
-
-            ### 🔄 Roadmap
-            - **Priority 2**: Web font support (WOFF, WOFF2), performance optimization
-            - **Priority 3**: SIMD acceleration, WebGPU integration, advanced typography
-
+          # Deploy SIDE_MODULE only (MAIN_MODULE for testing/NPM only)
+          wrangler r2 object put discere-os-wasm-production/freetype@${VERSION}/side.wasm \
+            --remote \
+            --file=install/wasm/freetype-side.wasm \
+            --content-type=application/wasm \
+            --cache-control="public, max-age=31536000, immutable"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
