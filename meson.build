@@ -85,6 +85,14 @@ ft2_sources += files([
   'src/base/ftinit.c',
 ])
 
+# WebCrypto and SIMD optimizations for Emscripten
+if host_machine.system() == 'emscripten'
+  ft2_sources += files([
+    'src/base/ftweb-crypto.c',
+    'src/base/ftsimd.c',
+  ])
+endif
+
 foreach mod: ft_main_modules
   source = mod
   if mod == 'winfonts'

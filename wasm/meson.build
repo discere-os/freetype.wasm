@@ -9,6 +9,8 @@ ft_main_link_args = [
   '-sENVIRONMENT=web,webview,worker',
   '-sNO_FILESYSTEM=1',
   '-sEXPORTED_RUNTIME_METHODS=["cwrap","ccall","UTF8ToString"]',
+  '-sASYNCIFY=1',
+  '-sASYNCIFY_IMPORTS=["js_crypto_sha256_async"]',
   '-O3',
   '-flto',
 ]
