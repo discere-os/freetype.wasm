@@ -1,0 +1,57 @@
+{
+  "dependencies": [
+    {
+      "name": "zlib",
+      "version": "1.3.1",
+      "type": "side",
+      "url": "https://wasm.discere.cloud/zlib.wasm/v1.3.1/side/zlib-side.wasm",
+      "integrity": "sha384-...",
+      "symbols": {
+        "required": [
+          "inflate",
+          "inflateInit_",
+          "inflateEnd"
+        ]
+      },
+      "loading": "lazy",
+      "fallback": null
+    },
+    {
+      "name": "libpng",
+      "version": "1.6.0",
+      "type": "side",
+      "url": "https://wasm.discere.cloud/libpng.wasm/v1.6.0/side/libpng-side.wasm",
+      "integrity": "sha384-...",
+      "symbols": {
+        "optional": [
+          "png_create_read_struct",
+          "png_read_image"
+        ]
+      },
+      "loading": "lazy",
+      "fallback": null
+    },
+    {
+      "name": "libc",
+      "version": "*",
+      "type": "builtin",
+      "url": null,
+      "integrity": null,
+      "symbols": {
+        "required": [
+          "malloc",
+          "free",
+          "realloc",
+          "memcpy",
+          "memset",
+          "memmove",
+          "qsort"
+        ]
+      },
+      "loading": "eager",
+      "fallback": null
+    }
+  ],
+  "manifest_version": "1.0",
+  "generated": "2025-01-17T00:00:00Z"
+}
